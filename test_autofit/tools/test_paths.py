@@ -15,7 +15,7 @@ class PatchPaths(af.DirectoryPaths):
         return directory / "sym_path"
 
     @property
-    def output_path(self) -> Path:
+    def _base_output_path(self) -> Path:
         return directory / "phase_output_path"
 
 
@@ -34,4 +34,6 @@ def test_restore(paths):
     assert paths.output_path.exists()
     assert not Path(paths._zip_path).exists()
 
+    # An unfinished search's restore claims the folder; release it as the fit's end would.
+    paths._release_running_lock()
     shutil.rmtree(paths.output_path)

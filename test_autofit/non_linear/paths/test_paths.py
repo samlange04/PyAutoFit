@@ -281,3 +281,170 @@ def test__preserve_in_zip__no_zip_is_a_no_op(tmp_path):
 
     assert not Path(paths._zip_path).exists()
     assert cache_file.exists()
+
+
+def _completed_archive(tmp_path, name="readonly_test"):
+    """A finished search's archive: files + ``.completed`` zipped, folder removed."""
+    paths = af.DirectoryPaths(name=name, path_prefix=str(tmp_path))
+    paths.remove_files = True
+    files_path = Path(paths._files_path)
+    files_path.mkdir(parents=True, exist_ok=True)
+    (files_path / "samples_summary.json").write_text("{}")
+    paths.completed()
+    paths.zip_remove()
+    assert Path(paths._zip_path).exists()
+    assert not Path(paths.output_path).exists()
+    return paths
+
+
+def test__restore__completed_archive_is_replayed_read_only(tmp_path):
+    import zipfile
+
+    from autofit.non_linear.paths import abstract
+
+    paths = _completed_archive(tmp_path)
+    base = Path(paths.output_path)
+    zip_path = Path(paths._zip_path)
+    before = (zip_path.stat().st_mtime_ns, zip_path.stat().st_size)
+
+    paths.restore()
+
+    # Extracted into a private folder beside the zip, which stays; the base folder is untouched.
+    replay = Path(paths.output_path)
+    assert replay != base and ".replay-" in replay.name
+    assert paths.is_complete
+    assert (replay / ".completed").exists()
+    assert not base.exists()
+    assert zip_path.exists()
+    assert paths._archive_is_complete
+    assert Path(paths._zip_path) == zip_path
+
+    paths.zip_remove()
+
+    # Kept for the process (later stages read and write caches here), dropped at exit.
+    assert replay.exists()
+    assert not paths._archive_is_complete
+    assert (zip_path.stat().st_mtime_ns, zip_path.stat().st_size) == before
+    with zipfile.ZipFile(zip_path) as f:
+        assert ".completed" in f.namelist()
+    abstract._cleanup_replay_dirs()
+    assert not replay.exists()
+
+
+def test__restore__dead_process_replay_folder_is_removed(tmp_path):
+    import socket
+
+    paths = _completed_archive(tmp_path)
+    base = Path(paths.output_path)
+    dead = base.parent / f"{base.name}.replay-{socket.gethostname()}-999999999"
+    dead.mkdir()
+    alive_other_host = base.parent / f"{base.name}.replay-elsewhere-1"
+    alive_other_host.mkdir()
+
+    paths.restore()
+
+    assert not dead.exists()
+    assert alive_other_host.exists()  # cannot be checked from here, left alone
+    paths.zip_remove()
+
+
+def test__restore__unfinished_archive_round_trips_as_before(tmp_path):
+    paths = af.DirectoryPaths(name="resume_test", path_prefix=str(tmp_path))
+    paths.remove_files = True
+    files_path = Path(paths._files_path)
+    files_path.mkdir(parents=True, exist_ok=True)
+    (files_path / "samples_summary.json").write_text("{}")
+    paths.zip_remove()
+
+    paths.restore()
+
+    assert not Path(paths._zip_path).exists()
+    assert not paths._archive_is_complete
+
+    paths.zip_remove()
+    assert Path(paths._zip_path).exists()
+
+
+def test__restore__two_processes_replaying_one_archive_do_not_share_a_folder(tmp_path, monkeypatch):
+    from autofit.non_linear.paths import abstract
+
+    first = _completed_archive(tmp_path)
+    first.restore()
+    first_dir = Path(first.output_path)
+    assert (first_dir / ".completed").exists()
+
+    # Another process (a different pid) replaying the same archive.
+    monkeypatch.setattr(abstract.os, "getpid", lambda: 999999998)
+    second = af.DirectoryPaths(name="readonly_test", path_prefix=str(tmp_path))
+    second.remove_files = True
+    second.restore()
+    second_dir = Path(second.output_path)
+    assert second_dir != first_dir and (second_dir / ".completed").exists()
+    second.zip_remove()
+    monkeypatch.undo()
+
+    # The second's replay and cleanup left the first's copy alone (the race of 2026-10-26),
+    # and every Paths of this process for the search resolves to the first's folder.
+    assert (first_dir / "files" / "samples_summary.json").exists()
+    third = af.DirectoryPaths(name="readonly_test", path_prefix=str(tmp_path))
+    assert Path(third.output_path) == first_dir
+    first.zip_remove()
+    abstract._cleanup_replay_dirs()
+    assert not first_dir.exists() and not second_dir.exists()
+
+
+def test__restore__unfinished_search_is_locked_against_a_second_process(tmp_path):
+    import json
+    import os
+    from autofit.non_linear.paths.abstract import SearchInProgressError
+
+    paths = af.DirectoryPaths(name="running_test", path_prefix=str(tmp_path))
+    paths.remove_files = True
+
+    # A fresh start claims the folder; the lock names this process.
+    paths.restore()
+    lock = paths._running_lock_path
+    assert lock.is_dir()
+    holder = json.loads((lock / "holder").read_text())
+    assert holder["pid"] == os.getpid()
+
+    # A second process on the same folder is refused while the holder is alive. The holder
+    # file is rewritten with the parent's pid: a lock naming this very process would be
+    # taken over (an earlier fit here that raised before releasing it).
+    (lock / "holder").write_text(json.dumps({**holder, "pid": os.getppid()}))
+    other = af.DirectoryPaths(name="running_test", path_prefix=str(tmp_path))
+    with pytest.raises(SearchInProgressError):
+        other.restore()
+    (lock / "holder").write_text(json.dumps(holder))
+
+    # Completing the fit releases the lock ...
+    files_path = Path(paths._files_path)
+    files_path.mkdir(parents=True, exist_ok=True)
+    (files_path / "samples_summary.json").write_text("{}")
+    paths.completed()
+    paths.zip_remove()
+    assert not lock.exists()
+
+    # ... and the finished archive replays read-only (no running lock).
+    other.restore()
+    assert not lock.exists() and other._archive_is_complete
+    other.zip_remove()
+
+
+def test__restore__dead_holder_lock_is_taken_over(tmp_path):
+    import json
+    import os
+
+    paths = af.DirectoryPaths(name="dead_holder_test", path_prefix=str(tmp_path))
+    paths.remove_files = True
+    lock = paths._running_lock_path
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    os.mkdir(lock)
+    # A pid that cannot be alive on this host, no SLURM job: the holder is dead.
+    (lock / "holder").write_text(json.dumps({"host": os.uname().nodename if hasattr(os, "uname") else "", "pid": 2**22 - 1}))
+
+    paths.restore()
+    assert paths._running_lock_held
+    assert json.loads((lock / "holder").read_text())["pid"] == os.getpid()
+    paths.zip_remove()
+    assert not lock.exists()
