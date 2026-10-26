@@ -409,9 +409,14 @@ def test__restore__unfinished_search_is_locked_against_a_second_process(tmp_path
     assert holder["pid"] == os.getpid()
 
     # A second process on the same folder is refused while the holder is alive. The holder
-    # file is rewritten with the parent's pid: a lock naming this very process would be
-    # taken over (an earlier fit here that raised before releasing it).
-    (lock / "holder").write_text(json.dumps({**holder, "pid": os.getppid()}))
+    # file is rewritten with the parent's pid (and start time, which guards against a reused
+    # pid): a lock naming this very process would be taken over (an earlier fit here that
+    # raised before releasing it).
+    from autofit.non_linear.paths.abstract import _pid_start_time
+
+    (lock / "holder").write_text(
+        json.dumps({**holder, "pid": os.getppid(), "pid_start": _pid_start_time(os.getppid())})
+    )
     other = af.DirectoryPaths(name="running_test", path_prefix=str(tmp_path))
     with pytest.raises(SearchInProgressError):
         other.restore()
