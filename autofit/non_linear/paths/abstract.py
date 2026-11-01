@@ -68,8 +68,8 @@ def _remove_dead_replay_dirs(base_output_path):
 #
 # A lock's holder is identified by host + pid (+ the pid's start time, against pid reuse) and,
 # when the process runs under a batch scheduler, by that scheduler's job id. Liveness is decided
-# in this order: the same process or the same job -> its own lock; same host -> the pid is
-# probed directly; a known scheduler -> its queue is asked, if its client is on PATH; otherwise
+# in this order: the same process -> its own lock; same host -> the pid is probed directly
+# (a live process of the same batch job is refused, it is another process); a known scheduler -> its queue is asked, if its client is on PATH; otherwise
 # the lock's heartbeat decides. The heartbeat is refreshed by a daemon thread for as long as the
 # lock is held, so the fallback works for a plain local run, HTCondor, SLURM, PBS, LSF, SGE or
 # anything else, and never depends on how often the search writes an update.
@@ -665,8 +665,10 @@ class AbstractPaths(ABC):
         pid start time and, under a batch scheduler, its job id. A second process finding one
         decides whether the holder is alive without assuming any particular scheduler (see
         ``_lock_holder_alive``) and raises ``SearchInProgressError`` if so. A dead holder's
-        lock is taken over with a warning, as is a lock left by the same job (a runner that
-        re-executed itself after an out-of-memory retry) or by this very process.
+        lock is taken over with a warning, as is a lock left by this very process (a runner
+        that re-executed itself after an out-of-memory retry keeps its pid). A live holder in
+        the same batch job is refused like any other: two processes of one job on one search
+        corrupt it just the same.
         """
         if not self.locks_output_folder:
             return
@@ -766,14 +768,19 @@ class AbstractPaths(ABC):
             return self._lock_heartbeat_fresh()
         same_host = other.get("host") == me.get("host")
         if same_host and other.get("pid") == me.get("pid"):
-            return False  # this very process: an earlier fit here raised before releasing it
-        job = other.get("job") or other.get("slurm_job_id")  # the latter: pre-2026-10-26 locks
-        if job and job == me.get("job"):
-            return False  # the same batch job, re-executed: its own lock
+            # This very process: an earlier fit here raised before releasing the lock, or the
+            # process re-executed itself (``os.execv`` keeps the pid and its start time).
+            return False
         if same_host and other.get("pid"):
             alive = _pid_alive(other["pid"], other.get("pid_start"))
             if alive is not None:
                 return alive
+        # A holder in the same batch job is NOT its own lock: one job can run several
+        # processes (one per GPU) that chain into the same search, and the second one
+        # starting a search the first is writing corrupts its checkpoint (2026-10-30, two slots
+        # of one lens in one SLURM job both "starting" the same SOURCE LP). The re-executed
+        # runner the same-job rule was meant for keeps its pid and is caught above.
+        job = other.get("job") or other.get("slurm_job_id")  # the latter: pre-2026-10-26 locks
         if job:
             scheduler = other.get("scheduler") or ("slurm" if "slurm_job_id" in other else None)
             alive = _scheduler_job_alive(scheduler, job)

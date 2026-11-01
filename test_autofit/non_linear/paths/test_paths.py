@@ -453,3 +453,36 @@ def test__restore__dead_holder_lock_is_taken_over(tmp_path):
     assert json.loads((lock / "holder").read_text())["pid"] == os.getpid()
     paths.zip_remove()
     assert not lock.exists()
+
+
+def test__restore__live_holder_in_the_same_batch_job_is_refused(tmp_path, monkeypatch):
+    """
+    Two processes of one batch job (one runner per GPU) chaining into the same unfinished
+    search must not share it: the second corrupted the first's checkpoint on 2026-10-30. Only
+    a dead holder of the same job (a runner relaunched as a new process) is taken over.
+    """
+    import json
+    import os
+    from autofit.non_linear.paths.abstract import SearchInProgressError, _pid_start_time
+
+    monkeypatch.setenv("SLURM_JOB_ID", "424242")
+    paths = af.DirectoryPaths(name="same_job_test", path_prefix=str(tmp_path))
+    paths.remove_files = True
+    lock = paths._running_lock_path
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    os.mkdir(lock)
+    host = os.uname().nodename if hasattr(os, "uname") else ""
+    live = {"host": host, "pid": os.getppid(), "pid_start": _pid_start_time(os.getppid()),
+            "scheduler": "slurm", "job": "424242"}
+    (lock / "holder").write_text(json.dumps(live))
+
+    with pytest.raises(SearchInProgressError):
+        paths.restore()
+    assert json.loads((lock / "holder").read_text())["pid"] == os.getppid()
+
+    (lock / "holder").write_text(json.dumps({**live, "pid": 2**22 - 1, "pid_start": None}))
+    paths.restore()
+    assert paths._running_lock_held
+    assert json.loads((lock / "holder").read_text())["pid"] == os.getpid()
+    paths.zip_remove()
+    assert not lock.exists()
