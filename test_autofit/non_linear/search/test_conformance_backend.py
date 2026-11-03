@@ -92,8 +92,9 @@ _GENERIC_FILES = frozenset(
         "files/samples.csv",
         "files/samples_info.json",
         "files/samples_summary.json",
-        "files/search_internal/.start_time",
-        "files/search_internal/.time",
+        "files/dataset_identity.json",
+        "files/.start_time",
+        "files/.time",
     }
 )
 

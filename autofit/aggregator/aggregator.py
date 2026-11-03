@@ -15,10 +15,11 @@ Example:
 import logging
 import os
 import zipfile
+import zlib
 from collections import defaultdict
 from pathlib import Path
 from shutil import rmtree
-from typing import List, Union, Iterator, Optional
+from typing import List, Union, Iterator, Optional, Tuple
 
 from autonerves.test_mode import is_test_mode
 
@@ -31,6 +32,35 @@ from .search_output import (
 )
 
 logger = logging.getLogger(__name__)
+
+ON_ERROR_VALUES = ("skip", "raise")
+"""
+What ``Aggregator.from_directory`` does with an unreadable zip: ``"skip"`` it and
+record it in ``Aggregator.errors``, or ``"raise"``.
+"""
+
+
+def _check_on_error(on_error: str):
+    if on_error not in ON_ERROR_VALUES:
+        raise ValueError(
+            f"on_error must be one of {ON_ERROR_VALUES}, not {on_error!r}."
+        )
+
+
+ZIP_READ_ERRORS = (zipfile.BadZipFile, EOFError, zlib.error)
+"""
+What reading one damaged result zip raises: ``BadZipFile`` for a missing or bad
+central directory or a CRC mismatch, ``EOFError`` and ``zlib.error`` for a member
+truncated or corrupted part-way through.
+"""
+
+
+def _bad_zip_error(zip_path: Path, error: Exception) -> zipfile.BadZipFile:
+    return zipfile.BadZipFile(
+        f"File is not a readable zip file ({type(error).__name__}: {error}): \n "
+        f"{zip_path.parent} \n"
+        f"{zip_path.name}"
+    )
 
 
 class AggregatorGroup:
@@ -85,20 +115,42 @@ class AggregatorGroup:
         return [group.values(name, parser=parser) for group in self.groups]
 
 
-def unzip_directory(directory: str):
+def unzip_directory(
+    directory: str, on_error: str = "raise"
+) -> List[Tuple[Path, Exception]]:
     """
     Unzip all zip files in a directory recursively.
+
+    Parameters
+    ----------
+    directory
+        The directory searched recursively for zips.
+    on_error
+        ``"raise"`` (the default) raises on the first unreadable zip; ``"skip"``
+        logs it, carries on, and returns it among the ``(path, exception)`` pairs.
+
+    Returns
+    -------
+    The ``(path, exception)`` of every zip that could not be read.
     """
+    _check_on_error(on_error)
+
+    errors = []
+
     for root, _, filenames in os.walk(directory):
         for filename in filenames:
             if filename.endswith(".zip"):
+                zip_path = Path(root) / filename
                 try:
-                    with zipfile.ZipFile(Path(root) / filename, "r") as f:
+                    with zipfile.ZipFile(zip_path, "r") as f:
                         f.extractall(Path(root) / filename[:-4])
-                except zipfile.BadZipFile:
-                    raise zipfile.BadZipFile(
-                        f"File is not a zip file: \n " f"{root} \n" f"{filename}"
-                    )
+                except ZIP_READ_ERRORS as e:
+                    if on_error == "raise":
+                        raise _bad_zip_error(zip_path, e) from e
+                    logger.warning(f"Skipping unreadable zip {zip_path}: {e}")
+                    errors.append((zip_path, e))
+
+    return errors
 
 
 def _is_search_output(root, dirs, filenames) -> bool:
@@ -131,6 +183,7 @@ class Aggregator:
         search_outputs: List[SearchOutput],
         grid_search_outputs: List[GridSearchOutput],
         temporary_directory: Optional[TemporaryExtraction] = None,
+        errors: Optional[List[Tuple[Path, Exception]]] = None,
     ):
         """
         Class to aggregate phase results for all subdirectories in a given directory.
@@ -144,9 +197,12 @@ class Aggregator:
             ``from_directory`` was called with ``unzip_temporary=True``. Held so
             ``close`` can remove it eagerly; the search outputs keep it alive
             regardless.
+        errors
+            The ``(path, exception)`` of every output ``from_directory`` could not
+            read and skipped (``on_error="skip"``), exposed as ``errors``.
         """
         if len(search_outputs) > 20:
-            print(
+            logger.info(
                 "When aggregating many searches it can be more efficient to use the database.\n"
                 "Checkout the database cookbook at this URL: "
                 "https://pyautofit.readthedocs.io/en/latest/cookbooks/database.html"
@@ -156,6 +212,7 @@ class Aggregator:
         # Set here rather than lazily: ``__getattr__`` returns an
         # ``AttributePredicate`` for any name it does not find.
         self._temporary_directory = temporary_directory
+        self.errors = list(errors or [])
 
     def grid_searches(self):
         """
@@ -180,6 +237,7 @@ class Aggregator:
         completed_only=False,
         reference: Optional[dict] = None,
         unzip_temporary: bool = False,
+        on_error: str = "skip",
     ) -> "Aggregator":
         """
         Aggregate phase results for all subdirectories in a given directory.
@@ -210,14 +268,21 @@ class Aggregator:
             beside it and carries a ``.completed`` file still uses that directory and is not extracted
             again; one whose sibling directory has no ``.completed`` file is extracted, because such a
             directory is written after the search was archived and does not stand for the search.
+        on_error
+            What to do with a zip that cannot be read (``ZIP_READ_ERRORS``): ``"skip"`` (the default) logs
+            a warning, leaves it out and records ``(path, exception)`` in the returned aggregator's
+            ``errors``, so one corrupt archive does not hide every other result; ``"raise"`` raises.
 
         Returns
         -------
         An aggregator whose search outputs are ordered by path, so that the same results tree gives
         the same order on every machine regardless of the filesystem's directory-entry order.
         """
-        print("Aggregator loading search_outputs... could take some time.")
+        _check_on_error(on_error)
 
+        logger.info("Aggregator loading search_outputs... could take some time.")
+
+        errors = []
         temporary_directory = None
         temporary_roots = []
         incomplete_count = 0
@@ -274,15 +339,21 @@ class Aggregator:
                             )
                         if extract_temporary:
                             extracted = temporary_path(zip_path, scan_directory)
+                        existed = extracted.exists()
                         try:
                             with zipfile.ZipFile(zip_path, "r") as f:
                                 f.extractall(extracted)
-                        except zipfile.BadZipFile:
-                            raise zipfile.BadZipFile(
-                                f"File is not a zip file: \n "
-                                f"{root} \n"
-                                f"{filename}"
+                        except ZIP_READ_ERRORS as e:
+                            if on_error == "raise":
+                                raise _bad_zip_error(zip_path, e) from e
+                            logger.warning(
+                                f"Aggregator: skipping unreadable zip {zip_path}: {e}"
                             )
+                            errors.append((zip_path, e))
+                            if not existed:
+                                # A partial extraction is not a search output.
+                                rmtree(extracted, ignore_errors=True)
+                            continue
                         if extract_temporary:
                             # Outside the tree being walked, so it is scanned separately.
                             temporary_roots.append(extracted)
@@ -371,31 +442,104 @@ class Aggregator:
                 search_outputs, grid_search_outputs = scan_all(test_mode_directory)
 
         if len(search_outputs) == 0:
-            print(f"\nNo search_outputs found in {directory}\n")
+            # Loud: an empty aggregator otherwise flows on into empty tables and
+            # plots that look like a result.
+            logger.warning(
+                f"Aggregator found no search outputs in {directory} "
+                f"(completed_only={completed_only}, unzip_temporary={unzip_temporary}, "
+                f"excluded as incomplete={incomplete_count}, unreadable={len(errors)})."
+            )
         else:
-            print(
-                f"\n A total of {str(len(search_outputs))} search_outputs and results were found."
+            logger.info(
+                f"A total of {str(len(search_outputs))} search_outputs and results were found."
             )
 
         # A search dropped for having no ``.completed`` file is invisible in the
         # count above, so a run that aggregates a fraction of its searches looks
         # like a complete one. Say how many were left out.
         if completed_only and incomplete_count > 0:
-            print(
-                f" {incomplete_count} further search_outputs were excluded because "
+            logger.warning(
+                f"{incomplete_count} further search_outputs were excluded because "
                 f"they have no .completed file."
+            )
+
+        if errors:
+            logger.warning(
+                f"{len(errors)} unreadable output(s) were skipped; see Aggregator.errors."
             )
 
         return cls(
             search_outputs,
             grid_search_outputs,
             temporary_directory=temporary_directory,
+            errors=errors,
         )
+
+    @classmethod
+    def from_index(
+        cls,
+        roots: Union[str, os.PathLike, List[Union[str, os.PathLike]]],
+        index_dir: Optional[Union[str, os.PathLike]] = None,
+        states: Tuple[str, ...] = ("completed",),
+        reference: Optional[dict] = None,
+        update: bool = True,
+    ) -> "Aggregator":
+        """
+        Aggregate the results a results index (``autofit.results.ResultsIndex``) lists,
+        reading zipped results in place: nothing is extracted to disk.
+
+        Parameters
+        ----------
+        roots
+            The directory (or directories) holding the results.
+        index_dir
+            Where the index is kept (default ``<root>/.autofit_index``; required with
+            several roots or a read-only tree).
+        states
+            The result states to include. The default, ``("completed",)``, leaves out
+            superseded results (an older sibling of a newer completed fit); add
+            ``"superseded"`` to keep them.
+        reference
+            A dictionary mapping paths to types to be used when loading models from disk.
+        update
+            Bring the index up to date first (only new or changed results are opened).
+            ``False`` uses the index as it stands.
+        """
+        from autofit.results import ResultsIndex
+
+        index = ResultsIndex(roots, index_dir=index_dir)
+        if update:
+            index.update()
+
+        states = {str(state) for state in states}
+        search_outputs = []
+        for record in index.records():
+            if record.state not in states:
+                continue
+            output_path = Path(record.output_path)
+            if record.has_zip and record.state != "corrupt_zip":
+                search_outputs.append(
+                    SearchOutput.from_zip(f"{output_path}.zip", reference=reference)
+                )
+            elif record.has_dir:
+                search_outputs.append(SearchOutput(output_path, reference=reference))
+
+        logger.info(
+            f"Aggregator.from_index: {len(search_outputs)} search outputs in states "
+            f"{sorted(states)}."
+        )
+        if not search_outputs:
+            logger.warning(
+                f"Aggregator.from_index found no search outputs in states "
+                f"{sorted(states)} (index: {index.index_dir}, counts: {index.counts()})."
+            )
+        return cls(search_outputs, [])
 
     def add_directory(
         self,
         directory: Union[str, Path],
         unzip_temporary: bool = False,
+        on_error: str = "skip",
     ):
         """
         Add a directory to the aggregator.
@@ -408,13 +552,17 @@ class Aggregator:
             If `True` zips are extracted into a temporary directory that is cleaned
             up automatically, as in ``from_directory``. The added search outputs
             keep that directory alive; ``close`` does not remove it.
+        on_error
+            As in ``from_directory``; skipped outputs are added to ``errors``.
         """
         aggregator = Aggregator.from_directory(
             directory,
             unzip_temporary=unzip_temporary,
+            on_error=on_error,
         )
         self.search_outputs.extend(aggregator.search_outputs)
         self.grid_search_outputs.extend(aggregator.grid_search_outputs)
+        self.errors.extend(aggregator.errors)
 
     def close(self):
         """
@@ -467,6 +615,7 @@ class Aggregator:
             return Aggregator(
                 self.search_outputs[item],
                 self.grid_search_outputs,
+                errors=self.errors,
             )
         return self.search_outputs[item]
 
@@ -500,10 +649,102 @@ class Aggregator:
         for predicate in predicates:
             search_outputs = predicate.filter(search_outputs)
         search_outputs = list(search_outputs)
-        print(f"Filter found a total of {str(len(search_outputs))} results")
+        logger.info(f"Filter found a total of {str(len(search_outputs))} results")
         return Aggregator(
             search_outputs=list(search_outputs),
             grid_search_outputs=self.grid_search_outputs,
+            errors=self.errors,
+        )
+
+    def latest_per(
+        self,
+        key: Tuple[str, ...] = ("path_prefix", "unique_tag", "name"),
+        by: str = "completed_at",
+    ) -> "Aggregator":
+        """
+        Keep, for each value of ``key``, only the search output with the greatest
+        ``by``: the latest of several fits of the same search to the same object
+        (sibling hashes, e.g. a rerun after a model or search setting changed).
+
+        ``completed_at`` comes from the status record or the ``.completed`` member of
+        the result's zip, never the zip's modification time, which copying or
+        re-zipping resets. Outputs with no ``by`` value lose to any that have one;
+        remaining ties go to the greater path, so the choice is the same on every
+        machine.
+
+        Parameters
+        ----------
+        key
+            Attributes of a search output that together name one fit of one object.
+            The default suits both layouts in use: the object in ``path_prefix``
+            (``unique_tag`` shared) or in ``unique_tag`` (``path_prefix`` shared).
+        by
+            The attribute that orders the outputs within a key.
+        """
+
+        def value_of(search_output, attribute):
+            value = getattr(search_output, attribute, None)
+            return None if value is None else str(value)
+
+        latest = {}
+        for search_output in self.search_outputs:
+            group = tuple(value_of(search_output, k) for k in key)
+            order = (
+                value_of(search_output, by) is not None,
+                value_of(search_output, by) or "",
+                str(search_output.directory),
+            )
+            if group not in latest or order > latest[group][0]:
+                latest[group] = (order, search_output)
+
+        search_outputs = sorted(
+            (search_output for _, search_output in latest.values()),
+            key=lambda output: str(output.directory),
+        )
+        logger.info(
+            f"latest_per kept {len(search_outputs)} of {len(self.search_outputs)} "
+            f"search outputs."
+        )
+        return Aggregator(
+            search_outputs=search_outputs,
+            grid_search_outputs=self.grid_search_outputs,
+            errors=self.errors,
+        )
+
+    def enrich(
+        self,
+        fn,
+        name: str,
+        overwrite: bool = False,
+        shard=None,
+    ):
+        """
+        Add a product computed from each saved result to the result itself, written to
+        ``files/<name>`` atomically, without rerunning any fit
+        (``autofit.results.enrich``).
+
+        Parameters
+        ----------
+        fn
+            ``fn(search_output)`` returns the product: a ``dict`` / ``list`` (JSON),
+            ``str``, ``bytes``, a path to a file, or ``None`` to skip that result.
+        name
+            The product's name (``files/<name>``; ``.json`` is added for JSON content
+            when it has no suffix).
+        overwrite
+            Rewrite the product where a result already holds it.
+        shard
+            ``"i/N"`` or ``(i, N)``: only shard ``i`` of ``N`` disjoint shards, so the
+            pass can be split between Slurm array tasks or processes.
+
+        Returns
+        -------
+        An ``EnrichReport``: what was written, already there, declined or failed.
+        """
+        from autofit.results.enrich import enrich
+
+        return enrich(
+            self.search_outputs, fn, name=name, overwrite=overwrite, shard=shard
         )
 
     def values(self, name: str, parser=lambda o: o) -> Iterator:

@@ -35,10 +35,13 @@ from .non_linear.samples import load_from_table
 from .non_linear.samples import SamplesStored
 from .aggregator.summary.aggregate_csv import AggregateCSV
 from .aggregator.summary.aggregate_csv import ValueType
+from .aggregator.summary.aggregate_csv.merge import merge_csv
 from .aggregator.summary.aggregate_images import AggregateImages
 from .aggregator.summary.aggregate_fits import AggregateFITS
 from autofit.aggregator.fit_interface import Fit
 from .aggregator.search_output import SearchOutput
+from .results.library import ResultsLibrary
+from . import export
 from .mapper import prior
 from .mapper.model import AbstractModel
 from .mapper.model import ModelInstance

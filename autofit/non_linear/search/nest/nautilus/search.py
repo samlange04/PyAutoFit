@@ -13,7 +13,13 @@ from typing import Dict, Optional, Tuple, TYPE_CHECKING
 from autofit import exc
 from autofit.mapper.prior_model.abstract import AbstractPriorModel
 from autofit.mapper.prior.vectorized import PriorVectorized
-from autofit.non_linear.checkpoint import DillCheckpointer, NativeFileCheckpointer
+from autofit.non_linear.checkpoint import (
+    DillCheckpointer,
+    NativeFileCheckpointer,
+    probe_hdf5,
+    quarantine_search_internal,
+    resume_state_usable,
+)
 from autofit.non_linear.parallel import fork_context
 from autofit.non_linear.search.abstract_search import NonLinearSearch
 from autofit.non_linear.search.posterior_kind import WEIGHTED
@@ -295,7 +301,7 @@ class Nautilus(NonLinearSearch):
     # once the fit completes.
     checkpointer = DillCheckpointer(strip_attributes=("pool_l", "pool_s"))
     resume_state = NativeFileCheckpointer(
-        NAUTILUS_FILENAME, loader=_resumed_by_nautilus
+        NAUTILUS_FILENAME, loader=_resumed_by_nautilus, probe=probe_hdf5
     )
 
     __identifier_fields__ = (
@@ -532,8 +538,10 @@ class Nautilus(NonLinearSearch):
         # directly.
         self.check_model(model=ctx.model)
 
+        # A checkpoint that cannot be opened (e.g. truncated by a killed job) is
+        # moved aside with its search_internal folder and the search starts fresh.
         if ctx.paths.supports_checkpointing and self.checkpoint_file is not None:
-            checkpoint_exists = Path(self.checkpoint_file).exists()
+            checkpoint_exists = resume_state_usable(ctx.paths, self.resume_state)
         else:
             checkpoint_exists = False
 
@@ -547,6 +555,18 @@ class Nautilus(NonLinearSearch):
                 "Starting new Nautilus non-linear search (no previous samples found)."
             )
 
+        try:
+            return self._run_sampler(ctx)
+        except np.linalg.LinAlgError as e:
+            # A checkpoint that opens but whose bounds nautilus cannot rebuild; only
+            # a resumed run is retried, once, from scratch.
+            if not checkpoint_exists:
+                raise
+            quarantine_search_internal(ctx.paths, reason=e)
+
+        return self._run_sampler(ctx)
+
+    def _run_sampler(self, ctx):
         if self.force_x1_cpu or ctx.pool.is_jax:
             return self.fit_x1_cpu(
                 fitness=ctx.fitness,
@@ -858,6 +878,28 @@ class Nautilus(NonLinearSearch):
                     )
 
         return search_internal
+
+    def progress(self, search_internal) -> Optional[Dict]:
+        """
+        The run's progress for the status record (``autofit.non_linear.status``): the
+        sampler's likelihood calls, live points, evidence, live-set fraction and
+        effective sample size; ``fraction`` is the share of ``n_like_max`` spent (none
+        when it is unbounded, since Nautilus stops on ``n_eff`` / ``f_live``).
+        """
+        progress = {
+            "n_like": int(search_internal.n_like),
+            "n_like_max": None,
+            "n_live": int(search_internal.n_live),
+        }
+        for key in ("log_z", "f_live", "n_eff"):
+            try:
+                progress[key] = float(getattr(search_internal, key))
+            except Exception:
+                pass
+        if self.n_like_max is not None and self.n_like_max != float("inf"):
+            progress["n_like_max"] = int(self.n_like_max)
+            progress["fraction"] = min(1.0, progress["n_like"] / self.n_like_max)
+        return progress
 
     def iterations_from(
         self, search_internal, iterations_per_full_update: Optional[float] = None
