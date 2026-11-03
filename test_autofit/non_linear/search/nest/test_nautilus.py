@@ -18,19 +18,23 @@ requires_nautilus = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize(
-    "steps, limit, expected_budgets, expected_updates",
+    "steps, limit, expected_budgets, expected_updates, expected_capped",
     [
-        ([(40, True)], None, [300], 0),
-        ([(320, False), (360, True)], None, [300, 620], 1),
-        ([(320, False), (640, False)], 600, [300, 600], 1),
-        ([(300, False)], 300, [300], 0),
-        ([(0, False)], None, [300], 0),
+        ([(40, True)], None, [300], 0, False),
+        ([(320, False), (360, True)], None, [300, 620], 1, False),
+        ([(320, False), (640, False)], 600, [300, 600], 1, True),
+        ([(300, False)], 300, [300], 0, True),
+        ([(300, True)], 300, [300], 0, False),
+        ([(0, False)], None, [300], 0, False),
     ],
 )
 def test__completion_and_likelihood_budgets(
-    monkeypatch, steps, limit, expected_budgets, expected_updates
+    monkeypatch, steps, limit, expected_budgets, expected_updates, expected_capped
 ):
-    """Convergence ends immediately; incomplete chunks advance by real calls."""
+    """
+    Convergence ends immediately; incomplete chunks advance by real calls; a run the
+    cap ended without converging is flagged `stopped_at_n_like_max`.
+    """
     search = af.Nautilus(
         name="completion_budget", n_live=10,
         iterations_per_full_update=300, n_like_max=limit,
@@ -57,6 +61,23 @@ def test__completion_and_likelihood_budgets(
     assert sampler.budgets == expected_budgets
     assert len(updates) == expected_updates
     assert all(update["during_analysis"] for update in updates)
+    assert search.stopped_at_n_like_max is expected_capped
+
+
+def test__capped_fit_is_left_resumable(monkeypatch):
+    """`_complete_fit` neither archives nor marks complete a fit the call cap ended."""
+    search = af.Nautilus(name="capped_resumable", n_live=10, n_like_max=100)
+    events = []
+    monkeypatch.setattr(search, "finalize_search_internal", lambda **kw: events.append("finalize"))
+    monkeypatch.setattr(search.paths, "completed", lambda: events.append("completed"))
+
+    search.stopped_at_n_like_max = True
+    search._complete_fit(search_internal=None)
+    assert events == []
+
+    search.stopped_at_n_like_max = False
+    search._complete_fit(search_internal=None)
+    assert events == ["finalize", "completed"]
 
 
 @pytest.mark.parametrize("limit", [None, float("inf"), 100])
