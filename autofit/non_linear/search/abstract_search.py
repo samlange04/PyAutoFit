@@ -44,6 +44,8 @@ from autofit.non_linear.search import capabilities as cap
 from autofit.non_linear.search.execution import SearchExecutionMixin, _SearchMeta
 from autofit.non_linear.search.internal_state import SearchInternalStateMixin
 from autofit.non_linear.search.updates import SearchUpdatesMixin
+from autofit.non_linear.status import status_notify, status_recorded
+from autofit.non_linear.status.identity import write_dataset_identity
 from autofit.non_linear.search.test_mode_bypass import TestModeBypass, TestModeMixin
 from autofit.non_linear.test_mode import test_mode_level, skip_fit_output
 
@@ -215,6 +217,7 @@ class NonLinearSearch(
         state.pop("_logger", None)
         state.pop("paths", None)
         state.pop("_fit_pools", None)
+        state.pop("_fit_status", None)
         return state
 
     @property
@@ -227,10 +230,13 @@ class NonLinearSearch(
     def timer(self) -> Optional[Timer]:
         """
         The timer of the search (how long the search took, how much parallelization
-        sped it up), or ``None`` in ``NullPaths`` mode (no output written to disk).
+        sped it up), or ``None`` when the paths keep no timer (``has_timer``: ``NullPaths``,
+        ``DatabasePaths``). It writes to ``files/`` (``AbstractPaths.timer_path``).
         """
+        if not getattr(self.paths, "has_timer", False):
+            return None
         try:
-            return Timer(self.paths.search_internal_path)
+            return Timer(self.paths.timer_path)
         except TypeError:
             pass
 
@@ -286,6 +292,11 @@ class NonLinearSearch(
         updated model whose priors represent the beliefs produced by this fit. Raises
         ``AssertionError`` if the model has 0 dimensions.
         """
+        with status_recorded(self):
+            return self._fit_and_output(model=model, analysis=analysis, info=info)
+
+    def _fit_and_output(self, model, analysis, info=None):
+        """The body of ``fit``, inside its status record (``status_recorded``)."""
         self.check_model(model=model)
 
         # Per-fit: set by `start_resume_fit` when the fit's pools are resolved, and read
@@ -394,6 +405,9 @@ class NonLinearSearch(
         if self.paths.has_timer:
             self.timer.start()
 
+        status_notify(self, "start")
+        write_dataset_identity(self, analysis)
+
         mode = test_mode_level()
         if mode >= 2:
             return TestModeBypass(self).run(
@@ -494,6 +508,8 @@ class NonLinearSearch(
 
         self.paths.completed()
 
+        status_notify(self, "completed", search_internal)
+
     def result_via_completed_fit(
         self,
         analysis: Analysis,
@@ -508,9 +524,11 @@ class NonLinearSearch(
 
         Optional tasks update the results on hard-disk depending on the `general.yaml` config file's `output`
         section: `force_visualize_overwrite=True` performs the visualization again, and `force_pickle_overwrite=True`
-        recreates the output files of the model-fit.
+        recreates the output files (to add a product to finished results, use `Aggregator.enrich`).
 
         """
+        status_notify(self, "skipped")
+
         model.freeze()
         samples_summary = self.paths.load_samples_summary()
         try:
@@ -546,16 +564,17 @@ class NonLinearSearch(
 
     def post_fit_output(self, search_internal, finalize_search_internal: bool = True):
         """
-        Cleans up the output folder after a completed non-linear search: removes the
-        folder of results so only its `.zip` file is left (for supercomputers with a
-        file-count limit), when `remove_files=True` in the `general.yaml` `output`
-        section. ``finalize_search_internal=False`` when the fit just ran, since
+        Archives the output folder of a completed non-linear search into its `.zip`
+        file (always), and then removes the folder so only the `.zip` is left (for
+        supercomputers with a file-count limit) only when `remove_files=True` in the
+        `general.yaml` `output` section; with `remove_files=False` both are kept.
+        ``finalize_search_internal=False`` when the fit just ran, since
         ``start_resume_fit`` finalized the internal state before writing ``.completed``.
         """
         if finalize_search_internal:
             self.finalize_search_internal(search_internal=search_internal)
 
-        if not self.disable_output:
+        if not self.disable_output and getattr(self.paths, "remove_files", False):
             self.logger.info("Removing all files except for .zip file")
 
         self.paths.zip_remove()
